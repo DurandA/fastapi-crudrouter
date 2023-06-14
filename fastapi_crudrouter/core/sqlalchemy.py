@@ -7,7 +7,7 @@ from ._types import DEPENDENCIES, PAGINATION, PYDANTIC_SCHEMA as SCHEMA
 import inspect
 
 try:
-    from sqlalchemy.orm import Session, immediateload
+    from sqlalchemy.orm import Session
     from sqlalchemy.ext.declarative import DeclarativeMeta as Model
     from sqlalchemy.exc import IntegrityError, NoResultFound
     from sqlalchemy import __version__ as sqlalchemy_version
@@ -102,7 +102,6 @@ class SQLAlchemyCRUDRouter(CRUDGenerator[SCHEMA]):
 
             res = await db.execute(
                 select(self.db_model)
-                .options(immediateload("*"))
                 .order_by(getattr(self.db_model, self._pk))
                 .limit(limit)
                 .offset(skip)
@@ -140,9 +139,7 @@ class SQLAlchemyCRUDRouter(CRUDGenerator[SCHEMA]):
             try:
                 (model,) = (
                     await db.execute(
-                        select(self.db_model)
-                        .options(immediateload("*"))
-                        .where(getattr(self.db_model, self._pk) == item_id)
+                        select(self.db_model).where(getattr(self.db_model, self._pk) == item_id)
                     )
                 ).one()
             except NoResultFound:
