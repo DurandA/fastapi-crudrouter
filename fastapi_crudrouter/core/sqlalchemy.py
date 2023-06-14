@@ -7,13 +7,11 @@ from ._types import DEPENDENCIES, PAGINATION, PYDANTIC_SCHEMA as SCHEMA
 import inspect
 
 try:
-    from sqlalchemy.orm import Session
+    from sqlalchemy.orm import Session, immediateload
     from sqlalchemy.ext.declarative import DeclarativeMeta as Model
-    from sqlalchemy.exc import IntegrityError, NoResultFound
-    from sqlalchemy import __version__ as sqlalchemy_version
-
-    if sqlalchemy_version >= "1.4":
-        from sqlalchemy.future import select
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.future import select
+    from sqlalchemy import __version__ as sqlalchemy_version        
 except ImportError:
     Model = None
     Session = None
@@ -79,33 +77,20 @@ class SQLAlchemyCRUDRouter(CRUDGenerator[SCHEMA]):
         )
 
     def _get_all(self, *args: Any, **kwargs: Any) -> CALLABLE_LIST:
-        def route(
+        async def route(
             db: Session = Depends(self.db_func),
             pagination: PAGINATION = self.pagination,
         ) -> List[Model]:
             skip, limit = pagination.get("skip"), pagination.get("limit")
 
-            db_models: List[Model] = (
-                db.query(self.db_model)
-                .order_by(getattr(self.db_model, self._pk))
-                .limit(limit)
-                .offset(skip)
-                .all()
-            )
-            return db_models
-
-        async def async_route(
-            db: Session = Depends(self.db_func),
-            pagination: PAGINATION = self.pagination,
-        ) -> List[Model]:
-            skip, limit = pagination.get("skip"), pagination.get("limit")
-
-            res = await db.execute(
+            res = db.execute(
                 select(self.db_model)
                 .order_by(getattr(self.db_model, self._pk))
                 .limit(limit)
                 .offset(skip)
             )
+            if inspect.isawaitable(res):
+                res = await res
             res = res.all()
 
             model: Model
@@ -116,101 +101,45 @@ class SQLAlchemyCRUDRouter(CRUDGenerator[SCHEMA]):
 
             return db_models
 
-        if self.use_async:
-            return async_route
-        else:
-            return route
+        return route
 
     def _get_one(self, *args: Any, **kwargs: Any) -> CALLABLE:
-        def route(
+        async def route(
             item_id: self._pk_type, db: Session = Depends(self.db_func)  # type: ignore
         ) -> Model:
-            model: Model = db.query(self.db_model).get(item_id)
+            model = db.get(self.db_model, item_id)
+            if inspect.isawaitable(model):
+                model = await model
 
             if model:
                 return model
             else:
                 raise NOT_FOUND from None
 
-        async def async_route(
-            item_id: self._pk_type, db: Session = Depends(self.db_func)  # type: ignore
-        ) -> Model:
-            model: Model
-            try:
-                (model,) = (
-                    await db.execute(
-                        select(self.db_model).where(getattr(self.db_model, self._pk) == item_id)
-                    )
-                ).one()
-            except NoResultFound:
-                model = None
-
-            if model:
-                return model
-            else:
-                raise NOT_FOUND from None
-
-        if self.use_async:
-            return async_route
-        else:
-            return route
+        return route
 
     def _create(self, *args: Any, **kwargs: Any) -> CALLABLE:
-        def route(
+        async def route(
             model: self.create_schema,  # type: ignore
             db: Session = Depends(self.db_func),
         ) -> Model:
             try:
                 db_model: Model = self.db_model(**model.dict())
                 db.add(db_model)
-                db.commit()
-                db.refresh(db_model)
+                if inspect.isawaitable(res := db.commit()):
+                    await res
+                if inspect.isawaitable(res := db.refresh(db_model)):
+                    await res
                 return db_model
             except IntegrityError:
-                db.rollback()
+                if inspect.isawaitable(res := db.rollback()):
+                    await res
                 raise HTTPException(422, "Key already exists") from None
 
-        async def async_route(
-            model: self.create_schema,  # type: ignore
-            db: Session = Depends(self.db_func),
-        ) -> Model:
-            try:
-                db_model: Model = self.db_model(**model.dict())
-                db.add(db_model)
-                await db.commit()
-                await db.refresh(db_model)
-                return db_model
-            except IntegrityError:
-                await db.rollback()
-                raise HTTPException(422, "Key already exists") from None
-
-        if self.use_async:
-            return async_route
-        else:
-            return route
+        return route
 
     def _update(self, *args: Any, **kwargs: Any) -> CALLABLE:
-        def route(
-            item_id: self._pk_type,  # type: ignore
-            model: self.update_schema,  # type: ignore
-            db: Session = Depends(self.db_func),
-        ) -> Model:
-            try:
-                db_model: Model = self._get_one()(item_id, db)
-
-                for key, value in model.dict(exclude={self._pk}).items():
-                    if hasattr(db_model, key):
-                        setattr(db_model, key, value)
-
-                db.commit()
-                db.refresh(db_model)
-
-                return db_model
-            except IntegrityError as e:
-                db.rollback()
-                self._raise(e)
-
-        async def async_route(
+        async def route(
             item_id: self._pk_type,  # type: ignore
             model: self.update_schema,  # type: ignore
             db: Session = Depends(self.db_func),
@@ -222,56 +151,39 @@ class SQLAlchemyCRUDRouter(CRUDGenerator[SCHEMA]):
                     if hasattr(db_model, key):
                         setattr(db_model, key, value)
 
-                await db.commit()
-                await db.refresh(db_model)
+                if inspect.isawaitable(res := db.commit()):
+                    await res
+                if inspect.isawaitable(res := db.refresh(db_model)):
+                    await res
 
                 return db_model
             except IntegrityError as e:
-                await db.rollback()
+                if inspect.isawaitable(res := db.rollback()):
+                    await res
                 self._raise(e)
 
-        if self.use_async:
-            return async_route
-        else:
-            return route
+        return route
 
     def _delete_all(self, *args: Any, **kwargs: Any) -> CALLABLE_LIST:
-        def route(db: Session = Depends(self.db_func)) -> List[Model]:
-            db.query(self.db_model).delete()
-            db.commit()
-
-            return self._get_all()(db=db, pagination={"skip": 0, "limit": None})
-
-        async def async_route(db: Session = Depends(self.db_func)) -> List[Model]:
-            await db.execute("delete from " + self.db_model.__tablename__)
-            await db.commit()
+        async def route(db: Session = Depends(self.db_func)) -> List[Model]:
+            if inspect.isawaitable(res := db.execute("delete from " + self.db_model.__tablename__)):
+                await res
+            if inspect.isawaitable(res := db.commit()):
+                await res
             return await self._get_all()(db=db, pagination={"skip": 0, "limit": None})
 
-        if self.use_async:
-            return async_route
-        else:
-            return route
+        return route
 
     def _delete_one(self, *args: Any, **kwargs: Any) -> CALLABLE:
-        def route(
-            item_id: self._pk_type, db: Session = Depends(self.db_func)  # type: ignore
-        ) -> Model:
-            db_model: Model = self._get_one()(item_id, db)
-            db.delete(db_model)
-            db.commit()
-
-            return db_model
-
-        async def async_route(
+        async def route(
             item_id: self._pk_type, db: Session = Depends(self.db_func)  # type: ignore
         ) -> Model:
             db_model: Model = await self._get_one()(item_id, db)
-            await db.delete(db_model)
-            await db.commit()
+            if inspect.isawaitable(res := db.delete(db_model)):
+                await res
+            if inspect.isawaitable(res := db.commit()):
+                await res
 
             return db_model
 
-        if self.use_async:
-            return async_route
-        else:
-            return route
+        return route
